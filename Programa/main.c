@@ -4,16 +4,18 @@
  * PIC12F675
  * *****************************************************************************
  * Pines:
- *  1 - Vdd (2.0 a 5.5)     - Vdd
- *  2 - GP5                 - Buzzer
- *  3 - GP4                 - Relee
- *  4 - GP3 / MCLR / Vpp    - Led Status
- *  5 - GP2 / INT           - Temp -
- *  6 - GP1 / ICSP CLK      - Temp +
- *  7 - GP0 / ICSP DAT      - NTC
- *  8 - Vss                 - Vss
+ *  1 - Vdd (2.0 a 5.5)           - Vdd
+ *  2 - GP5                 OUT   - Buzzer
+ *  3 - GP4                 OUT   - Relee
+ *  4 - GP3 / MCLR / Vpp    No puede ser OUT
+ *  5 - GP2 / INT           ANA   - NTC
+ *  6 - GP1 / ICSP CLK      IN PU - Temp +
+ *  7 - GP0 / ICSP DAT      IN PU - Temp -
+ *  8 - Vss                       - Vss
  * Clock:
  *  Interno 4 MHz
+ * ADC: 10°C +/- 700
+ *      20°C +/- 500
  * ************************************************************************** */
 #pragma config CPD = OFF
 #pragma config CP = OFF
@@ -40,12 +42,15 @@ __EEPROM_DATA( 0x80, 0x80, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00 );
 /* *************************************************************************** *
  * Definiciones
  */
-#define BEEP_LARGO 200
+#define BEEP_LARGO 1000
 #define BEEP_CORTO 50
 #define BEEP_SILENCIO 100
 #define BOTON_DELAY 500
-#define REFERENCIA_MAX 700
-#define REFERENCIA_MIN 500
+#define TEMP_MAX 20
+#define TEMP_MIN 10
+#define SAVE_EE_DELAY 20
+#define DELTA_RELAY 10
+#define DELTA_ADC 15
 
 /* *************************************************************************** *
  * Globales
@@ -55,14 +60,21 @@ volatile unsigned int timer0Div;
 volatile unsigned char flag2KHz;
 volatile unsigned char flag2Hz;
 
-unsigned char contBuzzer;
+unsigned int contBuzzer;
+unsigned char contLed;
+unsigned char contRelay;
 unsigned char Temperatura;
+unsigned int Referencia;
 
 unsigned int botonUpFiltro;
 unsigned int botonDownFiltro;
+unsigned char botonUpRebote;
+unsigned char botonDownRebote;
 
 unsigned int referenciaMax;
 unsigned int referenciaMin;
+
+unsigned char medicionPendiente;
 
 /* *************************************************************************** *
  * Interrupciones
@@ -126,21 +138,79 @@ void __interrupt() ISR(void)
 //    GIE = 1;  << NO SE DEBE HACER >>
 }
 
-void Beep(unsigned char duracion)
+void CalcularReferencias()
+{
+    referenciaMin = ((Temperatura - 10) * 20) + 500 - DELTA_ADC;
+    referenciaMax = ((Temperatura - 10) * 20) + 500 + DELTA_ADC;
+}
+
+void Beep(unsigned int duracion)
 {
     if(contBuzzer < duracion) contBuzzer = duracion;
 }
 
 void BotonUp()
 {
-    
+    if(Temperatura < TEMP_MAX)
+    {
+        Temperatura++;
+        Beep(BEEP_CORTO);
+        CalcularReferencias();
+        saveEE = SAVE_EE_DELAY;
+    }
+    else
+    {
+        Temperatura = TEMP_MAX;
+        Beep(BEEP_LARGO);
+    }
 }
 
 void BotonDown()
 {
-    
+    if(Temperatura > TEMP_MIN)
+    {
+        Temperatura--;
+        Beep(BEEP_CORTO);
+        CalcularReferencias();
+        saveEE = SAVE_EE_DELAY;
+    }
+    else
+    {
+        Temperatura = TEMP_MIN;
+        Beep(BEEP_LARGO);
+    }
 }
 
+void MedicionStart()
+{
+    if(medicionPendiente == 1) return;
+    ADCON0bits.GO = 1;
+    medicionPendiente = 1;
+}
+
+void MedicionCheck()
+{
+    if(medicionPendiente == 0) return;
+    if(ADCON0bits.GO) return;
+    Referencia = (unsigned int)((ADRESH << 8) + ADRESL);
+    medicionPendiente = 0;
+    
+    /* */
+    
+    if(Referencia > referenciaMax)
+    {
+        /* Temperatura por debajo del umbral */
+        if(contRelay < DELTA_RELAY) contRelay++;
+        if( !GPIObits.GP4 && (contRelay == DELTA_RELAY)) GPIObits.GP4 = 1;
+    }
+    else if(Referencia < referenciaMin)
+    {
+        /* Temperatura sobre el umbral */
+        if(contRelay) contRelay--;
+        if(GPIObits.GP4 && (contRelay == 0)) GPIObits.GP4 = 0;
+        
+    }
+}
 
 /* *************************************************************************** *
  * MAIN
@@ -173,18 +243,44 @@ void main(void)
         101         1:64        1:32
         110         1:128       1:64
         111         1:256       1:128
-     */
+    */
     OPTION_REG = 0b00001101;    /* PSA -> WDT 1:32 = 576 ms */
+    
     /**/
     GPIO = 0x00;
     /* Control del comparador */
     CMCON = 0x07;     /* Solamente necesario para el 675 */
-    ANSEL = 0x00;
+
     /* Configuracion de I/O */
     TRISIO = 0b00000111;
     /* Pull-up */
-    WPU = 0b00000110;
+    WPU = 0b00000011;
  
+    /*
+     ADC
+    bit 7 ADFM: A/D Result Formed Select bit
+        1 = Right justified
+        0 = Left justified
+    bit 6 VCFG: Voltage Reference bit
+        1 = VREF pin
+        0 = VDD
+    bit 5-4 Unimplemented: Read as zero
+    bit 3-2 CHS1:CHS0: Analog Channel Select bits
+        00 = Channel 00 (AN0)
+        01 = Channel 01 (AN1)
+        10 = Channel 02 (AN2)
+        11 = Channel 03 (AN3)
+    bit 1 GO/DONE: A/D Conversion STATUS bit
+        1 = A/D conversion cycle in progress. Setting this bit starts an A/D conversion cycle.
+         This bit is automatically cleared by hardware when the A/D conversion has completed.
+        0 = A/D conversion completed/not in progress
+    bit 0 ADON: A/D Conversion STATUS bit
+        1 = A/D converter module is operating
+        0 = A/D converter is shut-off and consumes no operating current
+    */
+    ADCON0 = 0b10001001;
+    ANSEL = 0b00000100;
+
     /*
         bit 7 Unimplemented: Read as ?0?
         bit 6 TMR1GE: Timer1 Gate Enable bit
@@ -217,7 +313,7 @@ void main(void)
             1 = Enables Timer1
             0 = Stops Timer1
      */
-    T1CON = 0b00000001;
+    T1CON = 0b00000000;
 
     /*
         bit 7 EEIE: EE Write Complete Interrupt Enable bit
@@ -235,7 +331,7 @@ void main(void)
             1 = Enables the TMR1 overflow interrupt
             0 = Disables the TMR1 overflow interrupt
      */
-    PIE1 = 0b00000001;
+    PIE1 = 0b00000000;
 
     /*
     bit 7 GIE: Global Interrupt Enable bit
@@ -268,7 +364,7 @@ void main(void)
     /*
      * Port Change Interrupt
      */
-    IOC = 0b00011000;
+    IOC = 0b00000000;
 
     
     saveEE = 0;
@@ -276,15 +372,20 @@ void main(void)
     flag2KHz = 0;
     flag2Hz = 0;
     contBuzzer = 0;
+    contLed = 0;
     botonUpFiltro = BOTON_DELAY / 2;
     botonDownFiltro = BOTON_DELAY / 2;
+    botonUpRebote = 0;
+    botonDownRebote = 0;
+    Referencia = 0;
+    medicionPendiente = 0;
+    contRelay = 0;
  
     Temperatura = iEEgetc(0x00);
 
-    if(Temperatura > 20) Temperatura = 10;
-    if(Temperatura < 10) Temperatura = 10;
+    if(Temperatura > TEMP_MAX || Temperatura < TEMP_MIN) Temperatura = (TEMP_MAX + TEMP_MIN) / 2;
 
-    referenciaMax = (Temperatura * 100)
+    CalcularReferencias();
     
     GIE = 1;    /* Habilito las interrupciones */
 
@@ -292,43 +393,64 @@ void main(void)
     {
         CLRWDT();
 
+        MedicionCheck();
+        
         /* Boton UP */  
-        if(GPIO & 0b00000010)
+        if(GPIObits.GP0 == 1)
         {
-            if(botonUpFiltro) botonUpFiltro--;
+            if(botonUpFiltro)
+            {
+                botonUpFiltro--;
+                if(botonUpFiltro == 0)
+                {
+                    botonUpRebote = 0;
+                }
+            }
         }
         else
         {
             if(botonUpFiltro < BOTON_DELAY)
             {
                botonUpFiltro++;
-               if(botonUpFiltro >= BOTON_DELAY)
+               if(botonUpFiltro >= BOTON_DELAY && botonUpRebote == 0)
                {
+                   botonUpRebote = 1;
                    BotonUp();
                }
             }
         }
         /* Boton DOWN */
-        if(GPIO & 0b00000010)
+        if(GPIObits.GP1 == 1)
         {
-            if(botonDownFiltro) botonDownFiltro--;
+            if(botonDownFiltro)
+            {
+                botonDownFiltro--;
+                if(botonDownFiltro == 0)
+                {
+                    botonDownRebote = 0;
+                }
+            }
         }
         else
         {
             if(botonDownFiltro < BOTON_DELAY)
             {
                botonDownFiltro++;
-               if(botonDownFiltro >= BOTON_DELAY)
+               if(botonDownFiltro >= BOTON_DELAY && botonDownRebote == 0)
                {
+                   botonDownRebote = 1;
                    BotonDown();
                }
             }
-        }        
+        }
         
         if(flag2Hz)
         {
             flag2Hz = 0;
-            GPIO ^= 0b00001000; /* Led Status */
+            contLed++;
+//            GPIObits.GP3 = (contLed &1);
+            
+            MedicionStart();
         }
         
         if(flag2KHz)
@@ -337,15 +459,18 @@ void main(void)
             if(contBuzzer)
             {
                 contBuzzer--;
-                GPIO ^= 0b00100000; /* Buzzer */
+                GPIObits.GP5 ^= 1; /* Buzzer */
             }
+
+            if(saveEE)
+            {
+                saveEE--;
+                if(saveEE == 0) iEEputc(0x00, Temperatura);
+            }
+
+
         }
 
-        if(saveEE)
-        {
-            saveEE = 0;
-            iEEputc(0x00, Temperatura);
-        }
         
     }
 }
